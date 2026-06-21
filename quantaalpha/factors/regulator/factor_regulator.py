@@ -11,6 +11,38 @@ from quantaalpha.factors.coder.factor_ast import (
 from quantaalpha.factors.coder.config import FACTOR_COSTEER_SETTINGS
 from quantaalpha.factors.coder.expr_parser import parse_expression
 
+# ---------------------------------------------------------------------------
+# Module-level shared in-run factor zoo.
+#
+# Each evaluator re-instantiates a FactorRegulator, so factors accepted earlier
+# in the same run live only in that instance's per-instance self.alphazoo and
+# are NOT visible to later evaluators. To dedup newly accepted factors against
+# EACH OTHER within a run, we keep a process-wide shared list of accepted
+# (factor_name, factor_expression) pairs. add_factor() appends to it, and the
+# duplication/novelty check also matches against it (in addition to the static
+# default_zoo.csv zoo loaded per instance).
+#
+# Gated by ENABLE_INRUN_DEDUP (default on). The static CSV zoo behaviour and the
+# depth/node caps are unaffected by this.
+# ---------------------------------------------------------------------------
+ENABLE_INRUN_DEDUP = True
+
+# Shared across all FactorRegulator instances in this process. List of
+# (factor_name, factor_expression) tuples.
+_INRUN_FACTOR_ZOO: List[Tuple[str, str]] = []
+
+
+def _inrun_zoo_df() -> pd.DataFrame:
+    """
+    Build a 2-column DataFrame view of the shared in-run zoo, shaped exactly like
+    the static CSV zoo (columns: factor_name, factor_expression) so it can be fed
+    directly to match_alphazoo, which iterates rows as (name, expression).
+    """
+    return pd.DataFrame(
+        _INRUN_FACTOR_ZOO, columns=["factor_name", "factor_expression"]
+    )
+
+
 class FactorRegulator(Evaluator):
     """
     FactorRegulator class to evaluate expressions for duplication and manage the factor zoo database.
@@ -73,11 +105,23 @@ class FactorRegulator(Evaluator):
                 - matched_alpha (str or None): Name of the matched alpha if available
         """
         try:
-            # Check for duplication
+            # Check for duplication against the static (per-instance) CSV zoo.
             duplicated_subtree_size, duplicated_subtree, matched_alpha = match_alphazoo(
                 expression, self.alphazoo
             )
-            
+
+            # Also check against the shared in-run zoo so that factors accepted
+            # earlier in THIS run (by other evaluator instances) are deduped
+            # against each other. Keep the largest duplicated subtree across both.
+            if ENABLE_INRUN_DEDUP and len(_INRUN_FACTOR_ZOO) > 0:
+                inrun_size, inrun_subtree, inrun_alpha = match_alphazoo(
+                    expression, _inrun_zoo_df()
+                )
+                if inrun_size > duplicated_subtree_size:
+                    duplicated_subtree_size = inrun_size
+                    duplicated_subtree = inrun_subtree
+                    matched_alpha = inrun_alpha
+
             num_free_args = count_free_args(expression)
             num_unique_vars = count_unique_vars(expression)
             num_all_nodes = count_all_nodes(expression)
@@ -216,14 +260,22 @@ class FactorRegulator(Evaluator):
         Returns:
             bool: True if the factor was added, False otherwise.
         """
-        new_factor = pd.DataFrame({
-                'factor_name': factor_name,
-                'factor_expression': factor_expression
-                })
-            
-        self.alphazoo = pd.concat([self.alphazoo, new_factor])
+        # Accept either scalars or parallel lists of names/expressions
+        # (the real pipeline calls this with lists: proposal.py add_factor(names, exprs)).
+        names = list(factor_name) if isinstance(factor_name, (list, tuple)) else [factor_name]
+        exprs = list(factor_expression) if isinstance(factor_expression, (list, tuple)) else [factor_expression]
+        new_factor = pd.DataFrame({'factor_name': names, 'factor_expression': exprs})
+
+        self.alphazoo = pd.concat([self.alphazoo, new_factor], ignore_index=True)
         self.new_factors.append((factor_name, factor_expression))
-        logger.info(f"Added new factor: {factor_name} with expression: {factor_expression}")
+
+        # Record EACH (name, expression) into the shared in-run zoo so subsequent
+        # evaluator instances dedup this run's earlier accepted factors against each other.
+        if ENABLE_INRUN_DEDUP:
+            for _nm, _ex in zip(names, exprs):
+                _INRUN_FACTOR_ZOO.append((_nm, _ex))
+
+        logger.info(f"Added {len(names)} factor(s) to zoo: {names}")
             
     def save_factor_zoo(self, output_path: Optional[str] = None) -> None:
         """

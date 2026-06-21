@@ -504,6 +504,43 @@ def run_evolution_loop(
         metric = t.get_primary_metric()
         metric_str = f"{metric:.4f}" if metric is not None else "N/A"
         logger.info(f"  {i+1}. {t.trajectory_id}: phase={t.phase.value}, RankIC={metric_str}")
+
+    # Aggregate / averaged OOS stats across ALL surviving trajectories
+    # (distributional view, not cherry-picked best-of).
+    try:
+        import statistics as _stats
+        all_trajs = controller.pool.get_all()
+        rank_ics = [t.get_raw_rank_ic() for t in all_trajs]
+        rank_ics = [v for v in rank_ics if v is not None]
+        n_surv = len(rank_ics)
+        if n_surv > 0:
+            mean_ric = _stats.fmean(rank_ics)
+            std_ric = _stats.pstdev(rank_ics) if n_surv > 1 else 0.0
+            agg_parts = [
+                f"n={n_surv}",
+                f"mean_RankIC={mean_ric:.4f}",
+                f"std_RankIC={std_ric:.4f}",
+            ]
+            # Walk-forward OOS metrics (opt-in feature) if present in backtest_metrics.
+            for wf_key in ("walk_forward_Rank_IC", "walk_forward_IC"):
+                wf_vals = [
+                    t.backtest_metrics.get(wf_key)
+                    for t in all_trajs
+                    if isinstance(getattr(t, "backtest_metrics", None), dict)
+                ]
+                wf_vals = [v for v in wf_vals if v is not None]
+                if wf_vals:
+                    wf_mean = _stats.fmean(wf_vals)
+                    wf_std = _stats.pstdev(wf_vals) if len(wf_vals) > 1 else 0.0
+                    agg_parts.append(
+                        f"mean_{wf_key}={wf_mean:.4f}(std={wf_std:.4f},n={len(wf_vals)})"
+                    )
+            logger.info("Aggregate OOS across survivors: " + ", ".join(agg_parts))
+        else:
+            logger.info("Aggregate OOS across survivors: no RankIC values available")
+    except Exception as _agg_err:
+        logger.warning(f"Failed to compute aggregate OOS stats: {_agg_err}")
+
     logger.info(f"Pool stats: {controller.pool.get_statistics()}")
     logger.info("="*60)
     if cleanup_on_finish:

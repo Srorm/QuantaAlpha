@@ -194,6 +194,49 @@ def apply_multiple_testing_haircut(decision: bool, exp=None) -> bool:
     return decision and passed
 
 
+# Metrics on which factor acceptance is judged. We RANK ON NET-OF-COST
+# performance: prefer the ``excess_return_with_cost.*`` variants (which subtract
+# transaction cost) and only fall back to the gross ``excess_return_without_cost.*``
+# variants when the net-of-cost key is absent. The dict may carry either variant,
+# so we read the keys defensively from whatever index is available.
+_NET_OF_COST_METRIC_BASES = [
+    "1day.{cost}.max_drawdown",
+    "1day.{cost}.information_ratio",
+    "1day.{cost}.annualized_return",
+]
+
+
+def _select_important_metrics(available_index):
+    """Pick the metric keys to compare on, preferring net-of-cost variants.
+
+    For each base metric we look first for the ``excess_return_with_cost`` key in
+    ``available_index``; if it's missing we fall back to the gross
+    ``excess_return_without_cost`` key. Plain ``IC`` is always appended when
+    present. The check is defensive so either variant (or neither) is tolerated.
+    """
+    try:
+        index_members = set(available_index)
+    except TypeError:
+        index_members = set()
+
+    selected = []
+    for base in _NET_OF_COST_METRIC_BASES:
+        with_cost = base.format(cost="excess_return_with_cost")
+        without_cost = base.format(cost="excess_return_without_cost")
+        if with_cost in index_members:
+            selected.append(with_cost)
+        elif without_cost in index_members:
+            selected.append(without_cost)
+        else:
+            # Neither variant materialized; keep the net-of-cost name so a
+            # downstream lookup still degrades gracefully (it just won't match).
+            selected.append(with_cost)
+
+    if "IC" not in selected:
+        selected.append("IC")
+    return selected
+
+
 def process_results(current_result, sota_result):
     # Convert the results to dataframes
     current_df = pd.DataFrame(current_result)
@@ -209,14 +252,9 @@ def process_results(current_result, sota_result):
             first_col = current_df.columns[0]
             current_df.rename(columns={first_col: "Current Result"}, inplace=True)
         
-        # Select important metrics for comparison
-        important_metrics = [
-            "1day.excess_return_without_cost.max_drawdown",
-            "1day.excess_return_without_cost.information_ratio",
-            "1day.excess_return_without_cost.annualized_return",
-            "IC",
-        ]
-        
+        # Select important metrics for comparison (prefer net-of-cost variants).
+        important_metrics = _select_important_metrics(current_df.index)
+
         # Filter the DataFrame to retain only the important metrics that exist
         available_metrics = [m for m in important_metrics if m in current_df.index]
         if available_metrics:
@@ -255,13 +293,8 @@ def process_results(current_result, sota_result):
     # Combine the dataframes on the Metric index
     combined_df = pd.concat([current_df, sota_df], axis=1)
 
-    # Select important metrics for comparison
-    important_metrics = [
-        "1day.excess_return_without_cost.max_drawdown",
-        "1day.excess_return_without_cost.information_ratio",
-        "1day.excess_return_without_cost.annualized_return",
-        "IC",
-    ]
+    # Select important metrics for comparison (prefer net-of-cost variants).
+    important_metrics = _select_important_metrics(combined_df.index)
 
     # Filter the combined DataFrame to retain only the important metrics that exist
     available_metrics = [m for m in important_metrics if m in combined_df.index]
