@@ -108,7 +108,14 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
                                 data_source = Path(__file__).parent.parent.parent.parent.parent / FACTOR_COSTEER_SETTINGS.data_folder
                             daily_pv_link = ws.workspace_path / "daily_pv.h5"
                             if not daily_pv_link.exists() and (data_source / "daily_pv.h5").exists():
-                                os.symlink(str(data_source / "daily_pv.h5"), str(daily_pv_link))
+                                _src = str(data_source / "daily_pv.h5"); _dst = str(daily_pv_link)
+                                try:
+                                    os.link(_src, _dst)        # hardlink: no admin, no copy (same volume) -- Windows-safe
+                                except OSError:
+                                    try:
+                                        os.symlink(_src, _dst)
+                                    except OSError:
+                                        import shutil as _sh; _sh.copy2(_src, _dst)
                             
                             # Execute factor
                             import subprocess

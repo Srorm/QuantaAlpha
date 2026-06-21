@@ -555,10 +555,17 @@ def SQRT(df: pd.DataFrame):
 
 @datatype_adapter
 def LOG(df:pd.DataFrame):
-    """Natural logarithm."""
+    """log1p: natural log of (x + 1). NOTE: log1p, NOT plain log; use LN(x) for true natural log."""
+    if isinstance(df, int):
+        return np.log1p(df)
+    return (df+1).apply(np.log)
+
+@datatype_adapter
+def LN(df:pd.DataFrame):
+    """True natural logarithm of x (no +1 offset)."""
     if isinstance(df, int):
         return np.log(df)
-    return (df+1).apply(np.log)
+    return df.apply(np.log)
 
 @datatype_adapter
 def INV(df: pd.DataFrame):

@@ -6,8 +6,9 @@ from quantaalpha.log import logger
 from quantaalpha.core.scenario import Scenario
 from quantaalpha.factors.coder.factor_ast import (
     match_alphazoo, count_free_args, count_unique_vars, count_all_nodes,
-    calculate_symbol_length, count_base_features
+    calculate_symbol_length, count_base_features, compute_depth
 )
+from quantaalpha.factors.coder.config import FACTOR_COSTEER_SETTINGS
 from quantaalpha.factors.coder.expr_parser import parse_expression
 
 class FactorRegulator(Evaluator):
@@ -141,7 +142,41 @@ class FactorRegulator(Evaluator):
         if num_all_nodes == 0:
             logger.warning(f"Expression has no nodes: {eval_dict['expr']}")
             return False
-        
+
+        # Hard gate A: reject expressions whose total node count exceeds the cap.
+        # Threshold read from config with a safe getattr default (60).
+        max_nodes_threshold = getattr(
+            FACTOR_COSTEER_SETTINGS, "max_nodes_threshold", 60
+        )
+        if num_all_nodes > max_nodes_threshold:
+            logger.warning(
+                f"Rejected expression (node cap exceeded): "
+                f"num_all_nodes={num_all_nodes} > max_nodes_threshold={max_nodes_threshold}. "
+                f"Expr: {eval_dict['expr']}"
+            )
+            return False
+
+        # Hard gate B: reject expressions whose AST depth exceeds the cap.
+        # Threshold read from config with a safe getattr default (8).
+        max_depth_threshold = getattr(
+            FACTOR_COSTEER_SETTINGS, "max_depth_threshold", 8
+        )
+        try:
+            expr_depth = compute_depth(eval_dict['expr'])
+        except Exception as e:
+            logger.warning(
+                f"Rejected expression (depth computation failed): "
+                f"Expr: {eval_dict['expr']}. Error: {str(e)}"
+            )
+            return False
+        if expr_depth > max_depth_threshold:
+            logger.warning(
+                f"Rejected expression (depth cap exceeded): "
+                f"depth={expr_depth} > max_depth_threshold={max_depth_threshold}. "
+                f"Expr: {eval_dict['expr']}"
+            )
+            return False
+
         # Calculate ratios
         free_args_ratio = float(num_free_args) / float(num_all_nodes)
         unique_vars_ratio = float(num_unique_vars) / float(num_all_nodes)

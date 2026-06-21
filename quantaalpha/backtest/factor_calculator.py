@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import subprocess
@@ -65,7 +66,8 @@ Only the following operations are allowed in expressions:
 
 ### **Mathematical Operations**
 - **PROD(A, n)**: Product of values in A over the past n days.
-- **LOG(A)**: Natural logarithm of each element in A.
+- **LOG(A)**: log1p — natural logarithm of (each element of A + 1). For true natural log use LN.
+- **LN(A)**: True natural logarithm of each element in A (no +1 offset).
 - **SQRT(A)**: Square root of each element in A.
 - **POW(A, n)**: Raise each element in A to the power of n.
 - **SIGN(A)**: Sign of each element in A.
@@ -187,9 +189,10 @@ Only the following operations are allowed in expressions:
             parsed_expr = parse_symbol(expr, df.columns)
             parsed_expr = parse_expression(parsed_expr)
             
-            for col in df.columns:
+            for col in sorted(df.columns, key=len, reverse=True):
                 if col.startswith('$'):
-                    parsed_expr = parsed_expr.replace(col[1:], f"df['{col}']")
+                    parsed_expr = re.sub(r'(?<![A-Za-z0-9_])' + re.escape(col[1:]) + r'(?![A-Za-z0-9_])',
+                                         f"df['{col}']", parsed_expr)
             
             exec_globals = {
                 'df': df,
@@ -213,6 +216,17 @@ Only the following operations are allowed in expressions:
             logger.debug(f"Expression parse failed: {str(e)}")
             return None
     
+    def _load_field_catalog(self) -> str:
+        """Return the available $field catalog (name: desc) from data_template/README.md."""
+        try:
+            readme = Path(__file__).resolve().parents[1] / 'factors' / 'data_template' / 'README.md'
+            lines = [ln for ln in readme.read_text(encoding='utf-8').splitlines() if ln.lstrip().startswith('$')]
+            if lines:
+                return '\n'.join(lines)
+        except Exception as e:
+            logger.warning(f"Could not load field catalog: {e}")
+        return '$open, $high, $low, $close, $volume, $vwap'
+
     def _calculate_with_llm(self, factor_info: Dict) -> Optional[pd.Series]:
         """
         Compute factor using LLM-generated code. Returns factor series or None.
@@ -265,7 +279,9 @@ The code should:
 
 {self.OPERATIONS_DOC}
 
-The input data is a pandas DataFrame with multi-index (datetime, instrument) and columns: $open, $high, $low, $close, $volume, $vwap.
+The input data is a pandas DataFrame with multi-index (datetime, instrument). You may ONLY reference the $columns in this authoritative catalog (name: description):
+
+{self._load_field_catalog()}
 
 Please output ONLY the factor expression string that can be directly used with the expression parser. 
 The expression should use $variable format (e.g., $close, $open, $volume).
@@ -373,23 +389,43 @@ class QlibDataProvider:
         self._initialized = True
         logger.info(f"Qlib initialized: {provider_uri} (region={region_str})")
         
-    def get_stock_data(self, 
+    def _load_field_catalog(self) -> str:
+        """Return the available $field catalog (name: desc) from data_template/README.md."""
+        try:
+            readme = Path(__file__).resolve().parents[1] / 'factors' / 'data_template' / 'README.md'
+            lines = [ln for ln in readme.read_text(encoding='utf-8').splitlines() if ln.lstrip().startswith('$')]
+            if lines:
+                return '\n'.join(lines)
+        except Exception as e:
+            logger.warning(f"Could not load field catalog: {e}")
+        return '$open, $high, $low, $close, $volume, $vwap'
+
+    def get_stock_data(self,
                       start_time: Optional[str] = None,
                       end_time: Optional[str] = None,
                       instruments: Optional[str] = None) -> pd.DataFrame:
         """Get stock data. Args: start_time, end_time, instruments (market)."""
-        self._init_qlib()
-        
-        from qlib.data import D
-        
         start_time = start_time or self.data_config.get('start_time', '2016-01-01')
         end_time = end_time or self.data_config.get('end_time', '2025-12-31')
-        instruments = instruments or self.data_config.get('market', 'csi300')
-        
+        instruments = instruments or self.data_config.get('market', 'all')   # full-A default
+
+        # Prefer the enriched daily_pv.h5 (full multi-factor column set) when available.
+        dpv = self.data_config.get('daily_pv_path') or os.environ.get('DAILY_PV_PATH')
+        if dpv and os.path.exists(dpv):
+            df = pd.read_hdf(dpv, key='data')
+            dtv = df.index.get_level_values('datetime')
+            df = df.loc[(dtv >= pd.Timestamp(start_time)) & (dtv <= pd.Timestamp(end_time))]
+            if '$return' not in df.columns:
+                df['$return'] = df['$close'] / df.groupby(level='instrument')['$close'].shift(1) - 1
+            logger.info(f"Loaded enriched daily_pv.h5: {len(df)} rows, {len(df.columns)} cols")
+            return df
+
+        self._init_qlib()
+        from qlib.data import D
         stock_list = D.instruments(instruments)
-        
+
         fields = ['$open', '$high', '$low', '$close', '$volume', '$vwap']
-        
+
         df = D.features(
             stock_list,
             fields,
@@ -397,12 +433,12 @@ class QlibDataProvider:
             end_time=end_time,
             freq='day'
         )
-        
+
         df.columns = fields
-        
+
         df['$return'] = df['$close'] / df.groupby('instrument')['$close'].shift(1) - 1
-        
-        logger.info(f"Loaded stock data: {len(df)} rows")
-        
+
+        logger.info(f"Loaded stock data (qlib bin, price/volume only): {len(df)} rows")
+
         return df
 

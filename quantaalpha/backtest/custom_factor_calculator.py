@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import warnings
 from pathlib import Path
@@ -217,10 +218,11 @@ class CustomFactorCalculator:
             finally:
                 _sys.stdout = old_stdout
             
-            for col in df.columns:
+            for col in sorted(df.columns, key=len, reverse=True):
                 if col.startswith('$'):
-                    expr = expr.replace(col[1:], f"df['{col}']")
-            
+                    expr = re.sub(r'(?<![A-Za-z0-9_])' + re.escape(col[1:]) + r'(?![A-Za-z0-9_])',
+                                  f"df['{col}']", expr)
+
             exec_globals = {
                 'df': df,
                 'np': np,
@@ -529,10 +531,11 @@ class CustomFactorDataLoader:
         expr = parse_symbol(self.label_expr, df.columns)
         expr = parse_expression(expr)
         
-        for col in df.columns:
+        for col in sorted(df.columns, key=len, reverse=True):
             if col.startswith('$'):
-                expr = expr.replace(col[1:], f"df['{col}']")
-        
+                expr = re.sub(r'(?<![A-Za-z0-9_])' + re.escape(col[1:]) + r'(?![A-Za-z0-9_])',
+                              f"df['{col}']", expr)
+
         exec_globals = {'df': df, 'np': np, 'pd': pd}
         for name in dir(func_lib):
             if not name.startswith('_'):
@@ -572,10 +575,22 @@ def get_qlib_stock_data(config: Dict) -> pd.DataFrame:
     
     start_time = data_config.get('start_time', '2016-01-01')
     end_time = data_config.get('end_time', '2025-12-31')
-    market = data_config.get('market', 'csi300')
-    
+    market = data_config.get('market', 'all')   # full-A default
+
+    # Prefer the enriched daily_pv.h5 (full multi-factor column set) when available,
+    # so every $-column the proposer can reference is present at backtest time too.
+    dpv = data_config.get('daily_pv_path') or os.environ.get('DAILY_PV_PATH')
+    if dpv and os.path.exists(dpv):
+        df = pd.read_hdf(dpv, key='data')
+        dtv = df.index.get_level_values('datetime')
+        df = df.loc[(dtv >= pd.Timestamp(start_time)) & (dtv <= pd.Timestamp(end_time))]
+        if '$return' not in df.columns:
+            df['$return'] = df['$close'] / df.groupby(level='instrument')['$close'].shift(1) - 1
+        logger.info(f"Loaded enriched daily_pv.h5: {len(df)} rows, {len(df.columns)} cols")
+        return df
+
     stock_list = D.instruments(market)
-    
+
     fields = ['$open', '$high', '$low', '$close', '$volume', '$vwap']
     df = D.features(
         stock_list,
@@ -584,11 +599,11 @@ def get_qlib_stock_data(config: Dict) -> pd.DataFrame:
         end_time=end_time,
         freq='day'
     )
-    
+
     df.columns = fields
-    
-    logger.debug(f"Loaded stock data: {len(df)} rows")
-    
+
+    logger.debug(f"Loaded stock data (qlib bin, price/volume only): {len(df)} rows")
+
     return df
 
 

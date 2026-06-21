@@ -140,29 +140,56 @@ def _load_factor_library(path: str) -> Dict[str, Any]:
 
 
 def _classify_quality(backtest_results: Dict[str, Any]) -> str:
-    """Classify factor quality based on backtest metrics."""
+    """Classify factor quality from backtest metrics (multi-criteria, reverse-direction aware).
+
+    A factor that predicts in the REVERSE direction (strongly NEGATIVE IC/IR) is still a valid
+    signal — you simply flip the sign (short the top / long the bottom, or use it to flag names
+    to avoid). So quality is judged on the ABSOLUTE strength of the cross-sectional signal, not
+    its sign. We prefer RankICIR (stable rank predictability) over a single information ratio,
+    and prefer the WITH-cost (net) figure over the gross one.
+    """
     if not backtest_results:
         return "low"
-    # Use information ratio or IC-related metrics
-    ic = None
-    for key in ["1day.excess_return_without_cost.information_ratio",
-                 "1day.excess_return_with_cost.information_ratio"]:
-        if key in backtest_results:
-            ic = backtest_results[key]
-            break
-    if ic is None:
-        # Try to find any IC-like metric
-        for key, val in backtest_results.items():
-            if "information_ratio" in key and isinstance(val, (int, float)):
-                ic = val
-                break
-    if ic is None:
-        return "medium"
-    if ic > 0.5:
-        return "high"
-    if ic > 0.1:
-        return "medium"
-    return "low"
+
+    def grab(patterns):
+        """Best matching numeric metric; prefer a with-cost variant when present."""
+        with_cost = None
+        any_val = None
+        for k, v in backtest_results.items():
+            if not isinstance(v, (int, float)):
+                continue
+            kl = str(k).lower()
+            if any(p in kl for p in patterns):
+                any_val = float(v)
+                if "with_cost" in kl:
+                    with_cost = float(v)
+        return with_cost if with_cost is not None else any_val
+
+    rank_icir = grab(["rank_icir", "rankicir", "rank icir"])
+    info_ratio = grab(["information_ratio", "info_ratio"])
+    mono = grab(["group_monoton", "monoton"])
+    # If monotonicity was computed, a 'high' factor must also show a strong (either-direction)
+    # quintile spread (|mono|~1 monotonic; near 0 = non-monotonic noise). Reverse-monotonic
+    # factors count via abs(). When monotonicity is unavailable, it does not block.
+    strong_mono = (mono is None) or (abs(mono) >= 0.7)
+
+    # Primary gate: |RankICIR| (stable rank signal, direction-agnostic).
+    if rank_icir is not None:
+        s = abs(rank_icir)
+        if s >= 0.3 and strong_mono:
+            return "high"
+        if s >= 0.1:
+            return "medium"
+        return "low"
+    # Fallback: |information ratio| (net-of-cost preferred via grab()).
+    if info_ratio is not None:
+        s = abs(info_ratio)
+        if s > 0.5 and strong_mono:
+            return "high"
+        if s > 0.1:
+            return "medium"
+        return "low"
+    return "medium"
 
 
 async def _broadcast(task_id: str, message: Dict[str, Any]):
@@ -242,10 +269,11 @@ async def _run_mining(task_id: str, req: MiningStartRequest):
             if req.factorsPerHypothesis is not None:
                 run_cfg.setdefault("factor", {})["factors_per_hypothesis"] = req.factorsPerHypothesis
 
-            # Apply parallel execution override from frontend
-            if req.parallelEnabled is not None:
-                run_cfg.setdefault("evolution", {})["parallel_enabled"] = req.parallelEnabled
-                run_cfg.setdefault("execution", {})["parallel_execution"] = req.parallelEnabled
+            # Force SEQUENTIAL execution for full-A regardless of the frontend flag:
+            # parallel full-A backtests each load ~10-25GB and OOM-kill the WSL VM even at 48GB.
+            # Sequential keeps peak memory to one backtest at a time. (Ignore req.parallelEnabled.)
+            run_cfg.setdefault("evolution", {})["parallel_enabled"] = False
+            run_cfg.setdefault("execution", {})["parallel_execution"] = False
 
             # Apply quality gate override from frontend
             if req.qualityGateEnabled is not None:
@@ -891,7 +919,6 @@ async def _run_backtest(task_id: str, req: BacktestStartRequest, config_path: st
             "-c", config_path,
             "--factor-source", req.factorSource,
             "--factor-json", factor_json_str,
-            "--skip-uncached",
             "-v",
         ]
 

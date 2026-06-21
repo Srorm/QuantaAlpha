@@ -1,4 +1,5 @@
 from typing import Optional
+from pathlib import Path
 
 from quantaalpha.coder.costeer.config import CoSTEERSettings
 from quantaalpha.core.conf import ExtendedSettingsConfigDict
@@ -25,10 +26,11 @@ class FactorCoSTEERSettings(CoSTEERSettings):
     python_bin: str = "python"
     """Path to the Python binary"""
     
-    factor_zoo_path: Optional[str] = None
+    factor_zoo_path: Optional[str] = str(Path(__file__).resolve().parents[1] / "factor_zoo" / "default_zoo.csv")
     """Path to the CSV file containing the factor zoo database (e.g., Alpha101 factors).
-    If None, only free arguments ratio and unique variables ratio checks will be performed.
-    Novelty check (duplication detection) requires a factor zoo file."""
+    Dedup / novelty check (duplication detection) is ON by default and points to the
+    bundled default_zoo.csv. Set to None to disable the factor-zoo duplication check;
+    in that case only free arguments ratio and unique variables ratio checks are performed."""
     
     duplication_threshold: int = 8
     """Threshold for duplication detection. If duplicated subtree size exceeds this value, 
@@ -42,6 +44,14 @@ class FactorCoSTEERSettings(CoSTEERSettings):
     """Maximum allowed number of unique base features (ER) in factor expressions.
     Base features are raw variables like $close, $open, $high, $low, $volume.
     Expressions using more than this number of distinct base features will be rejected."""
+
+    max_nodes_threshold: int = 60
+    """Hard cap on the total number of AST nodes in a factor expression.
+    Expressions with more than this many nodes are rejected outright."""
+
+    max_depth_threshold: int = 8
+    """Hard cap on the maximum AST depth of a factor expression.
+    Expressions deeper than this are rejected outright."""
 
 
 FACTOR_COSTEER_SETTINGS = FactorCoSTEERSettings()

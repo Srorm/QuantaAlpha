@@ -453,7 +453,7 @@ def run_evolution_loop(
                     )
                     controller.report_task_complete(task, trajectory)
                     completed_tasks.append(task)
-                    logger.info(f"Trajectory done: {trajectory.trajectory_id}, RankIC={trajectory.get_primary_metric()}")
+                    logger.info(f"Trajectory done: {trajectory.trajectory_id}, RankIC={trajectory.get_raw_rank_ic()}, fitness={trajectory.get_primary_metric()}")
 
             controller.advance_phase_after_parallel_completion(completed_tasks)
 
@@ -488,7 +488,7 @@ def run_evolution_loop(
                     feedback=traj_data.get("feedback"),
                 )
                 controller.report_task_complete(task, trajectory)
-                logger.info(f"Task done: trajectory_id={trajectory.trajectory_id}, RankIC={trajectory.get_primary_metric()}")
+                logger.info(f"Task done: trajectory_id={trajectory.trajectory_id}, RankIC={trajectory.get_raw_rank_ic()}, fitness={trajectory.get_primary_metric()}")
             except Exception as e:
                 logger.error(f"Task failed: {e}")
                 import traceback

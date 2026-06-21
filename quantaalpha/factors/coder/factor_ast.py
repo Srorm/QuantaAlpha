@@ -416,9 +416,11 @@ def count_number_nodes(node: Node) -> int:
     elif isinstance(node, BinaryOpNode):
         return count_number_nodes(node.left) + count_number_nodes(node.right)
     elif isinstance(node, ConditionalNode):
-        return (count_number_nodes(node.condition) + 
-                count_number_nodes(node.true_expr) + 
+        return (count_number_nodes(node.condition) +
+                count_number_nodes(node.true_expr) +
                 count_number_nodes(node.false_expr))
+    elif isinstance(node, UnaryOpNode):
+        return count_number_nodes(node.operand)
     return 0
 
 
@@ -463,6 +465,8 @@ def collect_unique_vars(node: Node, unique_vars: set) -> None:
         collect_unique_vars(node.condition, unique_vars)
         collect_unique_vars(node.true_expr, unique_vars)
         collect_unique_vars(node.false_expr, unique_vars)
+    elif isinstance(node, UnaryOpNode):
+        collect_unique_vars(node.operand, unique_vars)
 
 
 def count_all_nodes(expr: str) -> int:
@@ -535,15 +539,17 @@ def collect_base_features(node: Node, base_features: set) -> None:
         collect_base_features(node.condition, base_features)
         collect_base_features(node.true_expr, base_features)
         collect_base_features(node.false_expr, base_features)
+    elif isinstance(node, UnaryOpNode):
+        collect_base_features(node.operand, base_features)
 
 
 def count_nodes(node: Node) -> int:
     """
     Recursively count the number of Node instances in an AST.
-    
+
     Args:
         node: The root node of the AST or sub-tree
-        
+
     Returns:
         int: The number of Node instances in the tree
     """
@@ -554,9 +560,57 @@ def count_nodes(node: Node) -> int:
     elif isinstance(node, BinaryOpNode):
         return 1 + count_nodes(node.left) + count_nodes(node.right)
     elif isinstance(node, ConditionalNode):
-        return 1 + (count_nodes(node.condition) + 
-                    count_nodes(node.true_expr) + 
+        return 1 + (count_nodes(node.condition) +
+                    count_nodes(node.true_expr) +
                     count_nodes(node.false_expr))
+    elif isinstance(node, UnaryOpNode):
+        return 1 + count_nodes(node.operand)
+    return 0
+
+
+def compute_depth(expr: str) -> int:
+    """
+    Parse an expression and return the maximum depth of its AST.
+
+    The depth of a leaf node (NumberNode / VarNode) is 1. Internal nodes
+    add 1 to the maximum depth of their children. This walks
+    FunctionNode.args, BinaryOpNode.left/right, ConditionalNode children,
+    and UnaryOpNode.operand.
+
+    Args:
+        expr: A string representing a mathematical expression
+
+    Returns:
+        int: The maximum depth of the parsed AST
+    """
+    tree = parse_expression(expr)
+    return _node_depth(tree)
+
+
+def _node_depth(node: Node) -> int:
+    """
+    Recursively compute the maximum depth of an AST rooted at node.
+
+    Args:
+        node: The root node of the AST or sub-tree
+
+    Returns:
+        int: The maximum depth (leaf depth = 1)
+    """
+    if isinstance(node, (NumberNode, VarNode)):
+        return 1
+    elif isinstance(node, FunctionNode):
+        if not node.args:
+            return 1
+        return 1 + max(_node_depth(arg) for arg in node.args)
+    elif isinstance(node, BinaryOpNode):
+        return 1 + max(_node_depth(node.left), _node_depth(node.right))
+    elif isinstance(node, ConditionalNode):
+        return 1 + max(_node_depth(node.condition),
+                       _node_depth(node.true_expr),
+                       _node_depth(node.false_expr))
+    elif isinstance(node, UnaryOpNode):
+        return 1 + _node_depth(node.operand)
     return 0
 
 

@@ -17,6 +17,17 @@ import hashlib
 
 from quantaalpha.log import logger
 
+import os
+
+# --- Anti-overfitting evolution fitness (configurable) -----------------------------------------
+# Evolution ranks / selects parents by a PARSIMONY-ADJUSTED fitness instead of raw RankIC, so it
+# prefers simpler / more-stable factors over the highest raw RankIC (which tends to be the most
+# overfit survivor of a large search):
+#     fitness = RankIC * stability(RankICIR) - COMPLEXITY_LAMBDA * (total AST node count)
+# is_successful() still uses raw RankIC > 0 for validity (decoupled from ranking).
+_FITNESS_COMPLEXITY_LAMBDA = float(os.environ.get("FITNESS_COMPLEXITY_LAMBDA", "0.0005"))  # per node
+_FITNESS_ICIR_REF = float(os.environ.get("FITNESS_ICIR_REF", "0.5"))  # RankICIR giving neutral weight
+
 
 class RoundPhase(str, Enum):
     """Phase/type of a round in the evolutionary process."""
@@ -87,13 +98,42 @@ class StrategyTrajectory:
         content = f"{direction_id}_{round_idx}_{phase.value}_{ts}"
         return hashlib.md5(content.encode()).hexdigest()[:12]
     
-    def get_primary_metric(self) -> Optional[float]:
-        """Get the primary metric (RankIC) for comparison."""
+    def _total_expression_nodes(self) -> int:
+        """Total AST node count across this trajectory's factor expressions (complexity proxy)."""
+        from quantaalpha.factors.coder.factor_ast import count_all_nodes
+        total = 0
+        for f in (self.factors or []):
+            expr = (f or {}).get("expression") or (f or {}).get("factor_expression")
+            if not expr:
+                continue
+            try:
+                total += count_all_nodes(expr)
+            except Exception:
+                total += 30  # unparseable -> assume moderately complex (do not reward)
+        return total
+
+    def get_raw_rank_ic(self) -> Optional[float]:
+        """Raw (unadjusted) RankIC, for logging / validity checks."""
         return self.backtest_metrics.get("RankIC")
-    
+
+    def get_primary_metric(self) -> Optional[float]:
+        """Parsimony-adjusted fitness used for ranking / parent-selection (anti-overfitting):
+        fitness = RankIC * stability(RankICIR) - COMPLEXITY_LAMBDA * (total AST nodes). Among
+        factors of similar RankIC this prefers the simpler / more-stable one instead of the
+        highest raw RankIC (usually the most overfit). Use is_successful() for raw validity."""
+        rank_ic = self.backtest_metrics.get("RankIC")
+        if rank_ic is None:
+            return None
+        icir = self.backtest_metrics.get("RankICIR")
+        if icir is None:
+            icir = self.backtest_metrics.get("ICIR")
+        stability = 1.0 if icir is None else min(max(icir / _FITNESS_ICIR_REF, 0.5), 1.5)
+        complexity_penalty = _FITNESS_COMPLEXITY_LAMBDA * self._total_expression_nodes()
+        return rank_ic * stability - complexity_penalty
+
     def is_successful(self) -> bool:
-        """Check if this trajectory produced valid results."""
-        rank_ic = self.get_primary_metric()
+        """Valid result = positive RAW RankIC (independent of the parsimony-adjusted fitness)."""
+        rank_ic = self.backtest_metrics.get("RankIC")
         return rank_ic is not None and rank_ic > 0
     
     def to_summary_text(self) -> str:

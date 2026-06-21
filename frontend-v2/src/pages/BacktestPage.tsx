@@ -290,12 +290,12 @@ export const BacktestPage: React.FC = () => {
             <div className="text-sm space-y-1">
               <p className="text-muted-foreground">
                 独立回测在<strong className="text-foreground">测试集（2022-01-01 ~ 2025-12-26）</strong>上评估因子的样本外表现。
-                使用 CSI300 市场股票池，TopK Dropout 策略，LightGBM 模型。
+                使用全A股票池（5766只，基准 CSI300），TopK Dropout 策略（按因子信号持有 Top 300 只），LightGBM 模型。
               </p>
               <p className="text-muted-foreground">
                 <strong className="text-foreground">custom</strong> 模式仅使用因子库中的自定义因子；
                 <strong className="text-foreground">combined</strong> 模式将自定义因子与 Alpha158(20) 基线因子组合使用。
-                回测仅使用已缓存的因子，未缓存因子将自动跳过。
+                未缓存的因子会在回测时自动计算（首次稍慢；可先点"同步缓存"预缓存以加速）。
               </p>
             </div>
           </div>
@@ -441,7 +441,7 @@ export const BacktestPage: React.FC = () => {
                     {cacheStatus.need_compute > 0 && (
                       <span className="flex items-center gap-1 text-muted-foreground/70">
                         <AlertCircle className="h-3 w-3" />
-                        未缓存: {cacheStatus.need_compute}（将跳过）
+                        未缓存: {cacheStatus.need_compute}（将自动计算）
                       </span>
                     )}
                   </div>
@@ -462,7 +462,7 @@ export const BacktestPage: React.FC = () => {
                         <div
                           className="h-full bg-muted-foreground/20 transition-all"
                           style={{ width: `${(cacheStatus.need_compute / cacheStatus.total) * 100}%` }}
-                          title={`未缓存（跳过）: ${cacheStatus.need_compute}`}
+                          title={`未缓存（将计算）: ${cacheStatus.need_compute}`}
                         />
                       </>
                     )}
@@ -470,7 +470,7 @@ export const BacktestPage: React.FC = () => {
                   <p className="text-xs text-muted-foreground">
                     {cacheStatus.need_compute === 0
                       ? '所有因子已缓存，回测将快速执行'
-                      : `将使用 ${cacheStatus.h5_cached + cacheStatus.md5_cached} 个已缓存因子进行回测，${cacheStatus.need_compute} 个未缓存因子已自动跳过`}
+                      : `回测将使用全部 ${cacheStatus.total} 个因子（${cacheStatus.h5_cached + cacheStatus.md5_cached} 个走缓存，${cacheStatus.need_compute} 个实时计算）`}
                   </p>
                 </div>
               ) : null}
@@ -481,7 +481,7 @@ export const BacktestPage: React.FC = () => {
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2 border-t border-border/50">
             <div className="text-sm">
               <span className="text-muted-foreground">市场：</span>
-              <span className="font-medium ml-1">CSI 300（沪深300）</span>
+              <span className="font-medium ml-1">全A（全部A股 5766只，持有Top 300）</span>
             </div>
             <div className="text-sm">
               <span className="text-muted-foreground">回测区间：</span>

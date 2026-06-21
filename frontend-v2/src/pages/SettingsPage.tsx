@@ -17,7 +17,7 @@ interface SystemConfig {
   // Parameters
   defaultNumDirections: number;
   defaultMaxRounds: number;
-  defaultMarket: 'csi300' | 'csi500' | 'sp500';
+  defaultMarket: 'all' | 'csi300' | 'csi500' | 'sp500';
   // Advanced
   parallelExecution: boolean;
   qualityGateEnabled: boolean;
@@ -31,12 +31,12 @@ interface SystemConfig {
 const DEFAULT_CONFIG: SystemConfig = {
   apiKey: '',
   apiUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-  modelName: 'deepseek-v3',
+  modelName: 'claude-opus-4-8',
   qlibDataPath: '',
   resultsDir: '',
   defaultNumDirections: 2,
   defaultMaxRounds: 3,
-  defaultMarket: 'csi300',
+  defaultMarket: 'all',
   parallelExecution: true,
   qualityGateEnabled: true,
   backtestTimeout: 600,
@@ -99,7 +99,7 @@ export const SettingsPage: React.FC = () => {
           resultsDir: env.DATA_RESULTS_DIR || '',
           defaultNumDirections: 2,
           defaultMaxRounds: 3,
-          defaultMarket: 'csi300',
+          defaultMarket: 'all',
           parallelExecution: true,
           qualityGateEnabled: true,
           backtestTimeout: 600,
@@ -318,6 +318,9 @@ export const SettingsPage: React.FC = () => {
                   onChange={(e) => updateConfigField('modelName', e.target.value)}
                   className="w-full rounded-lg border border-input bg-background px-4 py-2 text-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary transition-all"
                 >
+                  <option value="claude-opus-4-8">Claude Opus 4.8（推荐）</option>
+                  <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+                  <option value="claude-haiku-4-5">Claude Haiku 4.5</option>
                   <option value="deepseek-v3">DeepSeek V3</option>
                   <option value="deepseek-r1">DeepSeek R1</option>
                   <option value="qwen-max">Qwen Max</option>
@@ -465,6 +468,7 @@ export const SettingsPage: React.FC = () => {
                     onChange={(e) => updateConfigField('defaultMarket', e.target.value)}
                     className="w-full rounded-lg border border-input bg-background px-4 py-2 text-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary transition-all"
                   >
+                    <option value="all">全A (全部A股, 5766只)</option>
                     <option value="csi300">CSI 300 (沪深300)</option>
                     <option value="csi500">CSI 500 (中证500)</option>
                     <option value="sp500">S&P 500</option>

@@ -43,7 +43,7 @@ factor_source:
 data:
   provider_uri: "~/.qlib/qlib_data/cn_data"
   region: "cn"
-  market: "csi300"
+  market: "all"   # full-A universe (5766 stocks)
   start_time: "2016-01-01"
   end_time: "2025-12-26"
 
@@ -117,8 +117,8 @@ backtest:
     module_path: "qlib.contrib.strategy"
     kwargs:
       signal: "<PRED>"
-      topk: 50
-      n_drop: 5
+      topk: 300      # 全A股票池中按因子信号持有 Top 300 只
+      n_drop: 30     # 每次调仓换出约10% (30/300)
 
   backtest:
     start_time: "2022-01-01"

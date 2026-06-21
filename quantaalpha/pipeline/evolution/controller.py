@@ -799,8 +799,12 @@ class EvolutionController:
         metrics = {
             "IC": None,
             "ICIR": None,
+            # NOTE: RankIC / RankICIR here originate from the qlib SigAnaRecord,
+            # which is computed over the TEST (OOS) prediction window. They are
+            # therefore already out-of-sample metrics.
             "RankIC": None,
             "RankICIR": None,
+            "group_monotonicity": None,
             "annualized_return": None,
             "information_ratio": None,
             "max_drawdown": None
@@ -815,6 +819,7 @@ class EvolutionController:
                 'ICIR': ['ICIR', 'icir'],
                 'RankIC': ['RankIC', 'Rank IC', 'rank_ic'],
                 'RankICIR': ['RankICIR', 'Rank ICIR', 'rank_icir'],
+                'group_monotonicity': ['group_monotonicity', 'GroupMonotonicity', 'monotonicity'],
                 'annualized_return': [
                     '1day.excess_return_with_cost.annualized_return',
                     '1day.excess_return_without_cost.annualized_return',

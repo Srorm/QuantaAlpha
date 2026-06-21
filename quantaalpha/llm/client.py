@@ -321,6 +321,11 @@ class ChatSession:
         pass
 
 
+# Once the embedding endpoint is found unavailable (e.g. Anthropic has no /embeddings), every
+# APIBackend degrades RAG to constant vectors and warns only ONCE per process (avoids log spam).
+_EMBEDDING_UNAVAILABLE = False
+
+
 class APIBackend:
     """
     This is a unified interface for different backends.
@@ -668,6 +673,19 @@ class APIBackend:
                 if i < max_retry - 1:
                     time.sleep(self.retry_wait_seconds)
             except Exception as e:  # noqa: BLE001
+                # No embedding endpoint (e.g. Anthropic returns 404 not_found_error for /embeddings):
+                # degrade RAG gracefully instead of retrying + crashing. Constant unit vectors keep
+                # CoSTEER knowledge retrieval running (everything is equally "similar").
+                if embedding and (
+                    isinstance(e, openai.NotFoundError)
+                    or getattr(e, "status_code", None) == 404
+                    or "not_found" in str(e).lower()
+                ):
+                    global _EMBEDDING_UNAVAILABLE
+                    if not _EMBEDDING_UNAVAILABLE:
+                        _EMBEDDING_UNAVAILABLE = True
+                        logger.warning("Embedding endpoint unavailable (404); RAG degraded to constant vectors (further notices silenced for this run).")
+                    return [[1.0] + [0.0] * 1535 for _ in kwargs.get("input_content_list", [])]
                 logger.warning(e)
                 logger.warning(f"Retrying {i+1}th time...")
                 if i < max_retry - 1:
@@ -678,6 +696,10 @@ class APIBackend:
     def _create_embedding_inner_function(
         self, input_content_list: list[str], **kwargs: Any
     ) -> list[Any]:  # noqa: ARG002
+        # No embedding endpoint (e.g. Anthropic has no /embeddings) -> degrade RAG to constant unit
+        # vectors so CoSTEER knowledge retrieval keeps running instead of crashing on repeated 404s.
+        if _EMBEDDING_UNAVAILABLE:
+            return [[1.0] + [0.0] * 1535 for _ in input_content_list]
         content_to_embedding_dict = {}
         filtered_input_content_list = []
         if self.use_embedding_cache:
@@ -857,6 +879,18 @@ class APIBackend:
                         if message["role"] == "system":
                             break
                 kwargs["response_format"] = {"type": "json_object"}
+
+            # Anthropic OpenAI-compatible endpoint: Opus/Claude reasoning models reject
+            # temperature / frequency_penalty / presence_penalty / seed / response_format.
+            # Strip them and request JSON in-prompt instead.
+            if str(model).lower().startswith("claude"):
+                for _k in ("temperature", "frequency_penalty", "presence_penalty", "seed"):
+                    kwargs.pop(_k, None)
+                if kwargs.pop("response_format", None) is not None:
+                    for _m in messages[::-1]:
+                        _m["content"] = _m["content"] + "\nPlease respond in json format."
+                        if _m["role"] == "system":
+                            break
             response = self.chat_client.chat.completions.create(**kwargs)
 
             
@@ -972,7 +1006,13 @@ def calculate_embedding_distance_between_str_list(
     if not source_str_list or not target_str_list:
         return [[]]
 
-    embeddings = APIBackend().create_embedding(source_str_list + target_str_list)
+    try:
+        embeddings = APIBackend().create_embedding(source_str_list + target_str_list)
+    except Exception as _e:
+        # No embeddings endpoint (e.g. Anthropic OpenAI-compat has no /embeddings) ->
+        # degrade RAG knowledge retrieval to no-similarity instead of failing the whole loop.
+        logger.warning(f"Embedding unavailable ({str(_e)[:80]}); RAG similarity disabled (zeros).")
+        return [[0.0] * len(target_str_list) for _ in source_str_list]
 
     source_embeddings = embeddings[: len(source_str_list)]
     target_embeddings = embeddings[len(source_str_list) :]

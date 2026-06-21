@@ -139,7 +139,61 @@ class BacktestRunner:
         
         return result_df
     
-    def _create_dataset(self, 
+    def _purge_embargo_segments(self, segments: Dict, trading_dates) -> Dict:
+        """Trim the last H+embargo trading dates from train (and valid) segments to
+        avoid label leakage (purge) plus a small embargo gap. Gated by
+        data.purge_embargo (default True). Best-effort: on any issue the original
+        segments are returned unchanged.
+
+        H = label horizon. The label Ref($close,-2)/Ref($close,-1)-1 has horizon 2,
+        plus a default embargo of 1 => drop the last 3 dates of train and valid.
+        """
+        try:
+            data_cfg = self.config.get('data', {}) if isinstance(self.config, dict) else {}
+            if not bool(data_cfg.get('purge_embargo', True)):
+                return segments
+            horizon = int(data_cfg.get('label_horizon', 2))
+            embargo = int(data_cfg.get('embargo', 1))
+            n_drop = max(0, horizon + embargo)
+            if n_drop == 0:
+                return segments
+
+            # Sorted unique trading dates as Timestamps.
+            dates = pd.DatetimeIndex(pd.to_datetime(pd.Index(trading_dates).unique())).sort_values()
+            if len(dates) == 0:
+                return segments
+
+            def _trim(seg):
+                # seg is typically (start, end); return a new (start, end') with end' moved
+                # back by up to n_drop trading dates that fall within the segment.
+                try:
+                    if not (isinstance(seg, (list, tuple)) and len(seg) == 2):
+                        return seg
+                    start, end = seg
+                    start_ts = pd.Timestamp(start)
+                    end_ts = pd.Timestamp(end)
+                    in_seg = dates[(dates >= start_ts) & (dates <= end_ts)]
+                    if len(in_seg) <= n_drop:
+                        # Segment too short to trim safely; leave unchanged.
+                        return seg
+                    new_end = in_seg[-(n_drop + 1)]
+                    return (start, new_end)
+                except Exception:
+                    return seg
+
+            new_segments = dict(segments)
+            for key in ('train', 'valid'):
+                if key in new_segments:
+                    trimmed = _trim(new_segments[key])
+                    if trimmed != new_segments[key]:
+                        logger.debug(f"  purge/embargo: {key} {new_segments[key]} -> {trimmed} (drop {n_drop} dates)")
+                    new_segments[key] = trimmed
+            return new_segments
+        except Exception as e:
+            logger.warning(f"purge/embargo skipped: {e}")
+            return segments
+
+    def _create_dataset(self,
                        factor_expressions: Dict[str, str],
                        computed_factors: Optional[pd.DataFrame] = None):
         """Create Qlib dataset (QlibDataLoader or precomputed factors + StaticDataLoader)."""
@@ -192,13 +246,25 @@ class BacktestRunner:
             'infer_processors': dataset_config['infer_processors']
         }
         
+        segments = dataset_config['segments']
+        try:
+            from qlib.data import D
+            cal = D.calendar(
+                start_time=data_config['start_time'],
+                end_time=data_config['end_time'],
+                freq='day'
+            )
+            segments = self._purge_embargo_segments(segments, cal)
+        except Exception as e:
+            logger.warning(f"purge/embargo calendar unavailable (Qlib mode): {e}")
+
         dataset = DatasetH(
             handler=DataHandlerLP(**handler_config),
-            segments=dataset_config['segments']
+            segments=segments
         )
-        
-        logger.debug(f"  Qlib mode: {len(expressions)} factors, train={dataset_config['segments']['train']}")
-        
+
+        logger.debug(f"  Qlib mode: {len(expressions)} factors, train={segments['train']}")
+
         return dataset
     
     def _create_dataset_with_computed_factors(self,
@@ -416,14 +482,24 @@ class BacktestRunner:
             def config(self, **kwargs):
                 pass
         
-        handler = PrecomputedDataHandler(combined_df_multi, dataset_config['segments'])
+        segments = dataset_config['segments']
+        try:
+            try:
+                _dates = combined_df_multi.index.get_level_values('datetime')
+            except KeyError:
+                _dates = combined_df_multi.index.get_level_values(0)
+            segments = self._purge_embargo_segments(segments, _dates)
+        except Exception as e:
+            logger.warning(f"purge/embargo skipped (custom mode): {e}")
+
+        handler = PrecomputedDataHandler(combined_df_multi, segments)
         dataset = DatasetH(
             handler=handler,
-            segments=dataset_config['segments']
+            segments=segments
         )
-        
-        logger.debug(f"  Custom factor mode: {len(feature_cols)} factors, {len(combined_df)} rows, train={dataset_config['segments']['train']}")
-        
+
+        logger.debug(f"  Custom factor mode: {len(feature_cols)} factors, {len(combined_df)} rows, train={segments['train']}")
+
         return dataset
     
     def _compute_label(self, label_expr: str) -> pd.DataFrame:
@@ -476,6 +552,156 @@ class BacktestRunner:
             logger.warning(f"Failed to load Qlib factors: {e}")
             return None
     
+    def _build_model(self, model_config: Dict):
+        """Instantiate the configured model. Mirrors the single-split branch logic
+        (lgb / xgboost / catboost) so walk-forward folds use the same model."""
+        mtype = model_config['type']
+        if mtype == 'lgb':
+            from qlib.contrib.model.gbdt import LGBModel
+            return LGBModel(**model_config['params'])
+        elif mtype in ('xgboost', 'xgb'):
+            from qlib.contrib.model.xgboost import XGBModel
+            return XGBModel(**model_config['params'])
+        elif mtype in ('catboost', 'cat'):
+            from qlib.contrib.model.catboost_model import CatBoostModel
+            return CatBoostModel(**model_config['params'])
+        else:
+            raise ValueError(f"Unsupported model type: {model_config['type']}")
+
+    def _walk_forward_metrics(self, dataset, model_config: Dict, bt_root: Dict) -> Dict:
+        """Slide train/valid/test forward in N folds, retrain per fold, and aggregate
+        (mean) IC / RankIC / return across folds. Opt-in (backtest.walk_forward).
+
+        Best-effort and self-contained: it builds fresh DatasetH copies that share the
+        same handler but use shifted segments, so the original `dataset` and the
+        default single-split path are untouched. Returns {} on any failure.
+        """
+        from qlib.data.dataset import DatasetH
+
+        n_folds = int(bt_root.get('walk_forward_folds', 3))
+        if n_folds < 1:
+            return {}
+
+        base_segments = self.config['dataset']['segments']
+        handler = getattr(dataset, 'handler', None)
+        if handler is None or 'train' not in base_segments or 'test' not in base_segments:
+            return {}
+
+        def _seg_bounds(seg):
+            return pd.Timestamp(seg[0]), pd.Timestamp(seg[1])
+
+        try:
+            tr_s, tr_e = _seg_bounds(base_segments['train'])
+            te_s, te_e = _seg_bounds(base_segments['test'])
+        except Exception:
+            return {}
+
+        has_valid = 'valid' in base_segments
+        if has_valid:
+            va_s, va_e = _seg_bounds(base_segments['valid'])
+
+        # Step size = test-window length / n_folds, so folds collectively walk the
+        # original test window forward. Each fold shifts every segment by k*step.
+        total_span = te_e - te_s
+        if total_span.days <= 0:
+            return {}
+        step = total_span / n_folds
+
+        ic_list, ric_list, ret_list = [], [], []
+
+        for k in range(n_folds):
+            shift = step * k
+            seg_k = {
+                'train': (tr_s + shift, tr_e + shift),
+            }
+            if has_valid:
+                seg_k['valid'] = (va_s + shift, va_e + shift)
+            # Test window is one step wide, walking forward through the original test span.
+            seg_k['test'] = (te_s + shift, te_s + shift + step)
+
+            try:
+                seg_k = self._purge_embargo_segments(seg_k, self._wf_calendar())
+            except Exception:
+                pass
+
+            try:
+                ds_k = DatasetH(handler=handler, segments=seg_k)
+                model_k = self._build_model(model_config)
+                model_k.fit(ds_k)
+                pred_k = model_k.predict(ds_k)
+                lbl_k = None
+                try:
+                    lbl_k = ds_k.prepare("test", col_set="label")
+                except Exception:
+                    lbl_k = None
+            except Exception as e:
+                logger.warning(f"  walk-forward fold {k} failed: {e}")
+                continue
+
+            if pred_k is None or lbl_k is None:
+                continue
+            p_s = pred_k.iloc[:, 0] if isinstance(pred_k, pd.DataFrame) else pred_k
+            y_s = lbl_k.iloc[:, 0] if isinstance(lbl_k, pd.DataFrame) else lbl_k
+            j = pd.concat([p_s.rename('p'), y_s.rename('y')], axis=1).dropna()
+            if len(j) == 0 or j.index.nlevels < 2:
+                continue
+            dtl = 'datetime' if 'datetime' in (j.index.names or []) else j.index.names[0]
+
+            def _per_date_ic(g, method=None):
+                if len(g) < 2:
+                    return np.nan
+                if method == 'spearman':
+                    return g['p'].corr(g['y'], method='spearman')
+                return g['p'].corr(g['y'])
+
+            try:
+                ic_k = j.groupby(level=dtl, group_keys=False).apply(_per_date_ic).dropna()
+                ric_k = j.groupby(level=dtl, group_keys=False).apply(
+                    lambda g: _per_date_ic(g, method='spearman')).dropna()
+                if len(ic_k) > 0:
+                    ic_list.append(float(ic_k.mean()))
+                if len(ric_k) > 0:
+                    ric_list.append(float(ric_k.mean()))
+                # Return proxy: equal-weight mean label of the top-decile predictions,
+                # averaged across dates in the fold.
+                def _topdecile_ret(g):
+                    if len(g) < 10:
+                        return np.nan
+                    thr = g['p'].quantile(0.9)
+                    top = g[g['p'] >= thr]
+                    return float(top['y'].mean()) if len(top) > 0 else np.nan
+                ret_k = j.groupby(level=dtl, group_keys=False).apply(_topdecile_ret).dropna()
+                if len(ret_k) > 0:
+                    ret_list.append(float(ret_k.mean()))
+            except Exception as e:
+                logger.warning(f"  walk-forward fold {k} metric calc failed: {e}")
+                continue
+
+        out = {}
+        if ic_list:
+            out['walk_forward_IC'] = float(np.mean(ic_list))
+        if ric_list:
+            out['walk_forward_Rank_IC'] = float(np.mean(ric_list))
+        if ret_list:
+            out['walk_forward_return'] = float(np.mean(ret_list))
+        if out:
+            out['walk_forward_folds'] = len(ic_list) or len(ret_list)
+            logger.debug(f"  walk-forward aggregated over {out['walk_forward_folds']} folds: {out}")
+        return out
+
+    def _wf_calendar(self):
+        """Trading calendar for walk-forward purge/embargo; empty index on failure."""
+        try:
+            from qlib.data import D
+            data_config = self.config['data']
+            return D.calendar(
+                start_time=data_config['start_time'],
+                end_time=data_config['end_time'],
+                freq='day'
+            )
+        except Exception:
+            return pd.DatetimeIndex([])
+
     def _train_and_backtest(self, dataset, exp_name: str, rec_name: str, output_name: Optional[str] = None) -> Dict:
         """Train model and run backtest."""
         from qlib.contrib.model.gbdt import LGBModel
@@ -488,20 +714,37 @@ class BacktestRunner:
         model_config = self.config['model']
         backtest_config = self.config['backtest']['backtest']
         strategy_config = self.config['backtest']['strategy']
-        
+
         metrics = {}
-        
+
+        # Opt-in walk-forward: aggregate (mean) IC/RankIC/return across folds and
+        # fold them into the metrics. Default OFF => identical single-split behavior.
+        bt_root = self.config.get('backtest', {}) if isinstance(self.config, dict) else {}
+        if bool(bt_root.get('walk_forward', False)):
+            try:
+                wf_metrics = self._walk_forward_metrics(dataset, model_config, bt_root)
+                if wf_metrics:
+                    metrics.update(wf_metrics)
+            except Exception as e:
+                logger.warning(f"Walk-forward aggregation skipped: {e}")
+
         with R.start(experiment_name=exp_name, recorder_name=rec_name):
             # Train model
             train_start = time.time()
             
             if model_config['type'] == 'lgb':
                 model = LGBModel(**model_config['params'])
+            elif model_config['type'] in ('xgboost', 'xgb'):
+                from qlib.contrib.model.xgboost import XGBModel
+                model = XGBModel(**model_config['params'])
+            elif model_config['type'] in ('catboost', 'cat'):
+                from qlib.contrib.model.catboost_model import CatBoostModel
+                model = CatBoostModel(**model_config['params'])
             else:
                 raise ValueError(f"Unsupported model type: {model_config['type']}")
-            
+
             model.fit(dataset)
-            print(f"[4/4] Train LightGBM done ({time.time()-train_start:.1f}s)")
+            print(f"[4/4] Train {model_config['type']} done ({time.time()-train_start:.1f}s)")
             
             # Generate prediction
             pred = model.predict(dataset)
@@ -535,6 +778,43 @@ class BacktestRunner:
                     logger.warning(f"Could not read IC result: {e}")
             except Exception as e:
                 logger.warning(f"IC analysis failed: {e}")
+
+            # ---- Group monotonicity on the OOS (test) window: sign-agnostic quintile spread ----
+            # A monotonic factor's quintile-mean forward returns rise (or fall, for a reverse
+            # signal) steadily with predicted rank; |monotonicity|~1 is strong, ~0 means
+            # non-monotonic (often overfit noise). Best-effort: never breaks the backtest.
+            try:
+                _lbl = None
+                for _kw in ({"col_set": "label"},):
+                    try:
+                        _lbl = dataset.prepare("test", **_kw)
+                        break
+                    except Exception:
+                        _lbl = None
+                if _lbl is not None and isinstance(pred, (pd.Series, pd.DataFrame)):
+                    _lbl_s = _lbl.iloc[:, 0] if isinstance(_lbl, pd.DataFrame) else _lbl
+                    _p_s = pred.iloc[:, 0] if isinstance(pred, pd.DataFrame) else pred
+                    _j = pd.concat([_p_s.rename("p"), _lbl_s.rename("y")], axis=1).dropna()
+                    if len(_j) > 0 and _j.index.nlevels >= 2:
+                        _dtl = "datetime" if "datetime" in (_j.index.names or []) else _j.index.names[0]
+                        def _date_mono(g):
+                            if len(g) < 10 or g["p"].nunique() < 5:
+                                return np.nan
+                            try:
+                                qb = pd.qcut(g["p"].rank(method="first"), 5, labels=False, duplicates="drop")
+                            except Exception:
+                                return np.nan
+                            gm = g.groupby(qb)["y"].mean().values
+                            if len(gm) < 3:
+                                return np.nan
+                            return float(np.corrcoef(gm, np.arange(len(gm)))[0, 1])
+                        _mser = _j.groupby(level=_dtl, group_keys=False).apply(_date_mono).dropna()
+                        if len(_mser) > 0:
+                            metrics['group_monotonicity'] = float(_mser.mean())
+                            print(f"  Group monotonicity (OOS): {metrics['group_monotonicity']:.4f}")
+            except Exception as e:
+                logger.warning(f"Monotonicity computation skipped: {e}")
+
             # Portfolio backtest
             try:
                 bt_start = time.time()

@@ -2,6 +2,7 @@
 import pandas as pd
 import numpy as np
 import os
+import re
 from quantaalpha.factors.coder.expr_parser import parse_expression, parse_symbol
 from quantaalpha.factors.coder.function_lib import *
 
@@ -13,9 +14,9 @@ def calculate_factor(expr: str, name: str):
     expr = parse_symbol(expr, df.columns)
     expr = parse_expression(expr)
 
-    # replace '$var' by 'df['var'] to extract var's actual values
-    for col in df.columns:
-        expr = expr.replace(col[1:], f"df[\'{col}\']")
+    # replace bare var by df['$var']; longest-first + word boundaries (parse_symbol stripped the $)
+    for col in sorted(df.columns, key=len, reverse=True):
+        expr = re.sub(r"(?<![A-Za-z0-9_])" + re.escape(col[1:]) + r"(?![A-Za-z0-9_])", f"df[\'{col}\']", expr)
 
     df[name] = eval(expr)
     result = df[name].astype(np.float64)

@@ -29,7 +29,7 @@ export interface TaskConfig {
   modelName?: string;
 
   // Backtest configuration
-  market?: 'csi300' | 'csi500' | 'sp500';
+  market?: 'all' | 'csi300' | 'csi500' | 'sp500';
   startDate?: string;
   endDate?: string;
 

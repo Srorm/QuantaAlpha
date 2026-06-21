@@ -1,7 +1,10 @@
 import json
+import math
+import threading
 from pathlib import Path
 
 import pandas as pd
+import yaml
 from jinja2 import Environment, StrictUndefined
 
 from quantaalpha.core.experiment import Experiment
@@ -21,6 +24,174 @@ MAX_JSON_PARSE_RETRIES = 3
 
 base_feedback_prompts = Prompts(file_path=Path(__file__).parent / "prompts" / "prompts.yaml")
 DIRNAME = Path(__file__).absolute().resolve().parent
+
+
+# ============================================================
+# MULTIPLE-TESTING CONTROLS
+# ------------------------------------------------------------
+# Every time a factor/hypothesis acceptance decision is evaluated we increment
+# a process-wide running trial count. The more trials we have run this session,
+# the higher the IC/IR bar required to accept a new "best result", which guards
+# against multiple-comparisons / data-snooping bias (the more factors you try,
+# the more likely one looks good purely by chance).
+#
+# Defaults are intentionally gentle: with the default Bonferroni-style
+# deflation the effective threshold grows like sqrt(log(trials)), so early
+# trials are only mildly penalized and behavior is never broken.
+# ============================================================
+
+# Process-wide running trial counter. Guarded by a lock so parallel branches
+# (multiprocessing forks share their own copy, threads share this one) do not
+# race on increments.
+_MT_TRIAL_LOCK = threading.Lock()
+_MT_TRIAL_COUNT = 0
+
+# Cache of the loaded multiple_testing config so we only read the YAML once.
+_MT_CONFIG_CACHE = None
+
+# Safe fallback defaults if the config file is missing or unreadable.
+_MT_DEFAULTS = {
+    "enabled": True,
+    "base_ic_threshold": 0.02,
+    "deflation": "bonferroni",
+}
+
+
+def _load_multiple_testing_config() -> dict:
+    """Read the ``multiple_testing`` section from configs/experiment.yaml.
+
+    Returns a dict that always contains the keys in ``_MT_DEFAULTS``. Any
+    failure (missing file, parse error, missing section) falls back to safe
+    defaults so the acceptance loop never breaks because of config issues.
+    """
+    global _MT_CONFIG_CACHE
+    if _MT_CONFIG_CACHE is not None:
+        return _MT_CONFIG_CACHE
+
+    cfg = dict(_MT_DEFAULTS)
+    try:
+        # quantaalpha/factors/feedback.py -> project root is parents[2].
+        project_root = Path(__file__).resolve().parents[2]
+        config_file = project_root / "configs" / "experiment.yaml"
+        if config_file.exists():
+            loaded = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
+            section = loaded.get("multiple_testing") if isinstance(loaded, dict) else None
+            if isinstance(section, dict):
+                for key in _MT_DEFAULTS:
+                    if section.get(key) is not None:
+                        cfg[key] = section[key]
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(f"[MultipleTesting] Failed to load config, using defaults: {exc}")
+
+    _MT_CONFIG_CACHE = cfg
+    return cfg
+
+
+def _next_trial_count() -> int:
+    """Increment and return the process-wide running trial count."""
+    global _MT_TRIAL_COUNT
+    with _MT_TRIAL_LOCK:
+        _MT_TRIAL_COUNT += 1
+        return _MT_TRIAL_COUNT
+
+
+def _deflated_threshold(base_threshold: float, trials: int, deflation: str) -> float:
+    """Apply the multiple-testing haircut to the base acceptance threshold.
+
+    bonferroni : effective = base * sqrt(log(max(trials, 2)))
+    none       : effective = base (no haircut)
+
+    ``max(trials, 2)`` keeps ``log`` positive (log(1)=0 would zero the bar).
+    """
+    if deflation == "none":
+        return base_threshold
+    # Default / 'bonferroni': gentle sqrt(log(.)) growth.
+    return base_threshold * math.sqrt(math.log(max(trials, 2)))
+
+
+def _extract_candidate_ic(exp):
+    """Best-effort: pull the candidate factor's IC from an Experiment result
+    (handles dict / pandas Series / DataFrame indexed by metric name). None if not found."""
+    if exp is None:
+        return None
+    res = getattr(exp, "result", None)
+    if res is None:
+        return None
+    keys = ("IC", "ic", "Rank IC", "RankIC", "rank_ic")
+    try:
+        if isinstance(res, dict):
+            for k in keys:
+                v = res.get(k)
+                if isinstance(v, (int, float)):
+                    return float(v)
+            return None
+        if isinstance(res, pd.Series):
+            for k in keys:
+                if k in res.index:
+                    return float(res[k])
+            return None
+        if isinstance(res, pd.DataFrame):
+            for k in keys:
+                if k in res.index:
+                    v = res.loc[k]
+                    return float(v.iloc[0] if hasattr(v, "iloc") else v)
+            return None
+    except Exception:
+        return None
+    return None
+
+
+def apply_multiple_testing_haircut(decision: bool, exp=None) -> bool:
+    """Gate an LLM accept decision through the multiple-testing haircut.
+
+    Increments the running trial count for *every* evaluated hypothesis,
+    computes the deflated IC/IR acceptance bar, and logs both. The haircut
+    only ever makes acceptance *stricter* and is fully disabled when
+    ``multiple_testing.enabled`` is false (in which case we still log the
+    trial count for observability but pass the decision through untouched).
+    """
+    cfg = _load_multiple_testing_config()
+    trials = _next_trial_count()
+
+    if not bool(cfg.get("enabled", True)):
+        logger.info(
+            f"[MultipleTesting] disabled | trial #{trials} | decision passthrough={decision}"
+        )
+        return decision
+
+    base_threshold = float(cfg.get("base_ic_threshold", 0.02))
+    deflation = str(cfg.get("deflation", "bonferroni"))
+    effective_threshold = _deflated_threshold(base_threshold, trials, deflation)
+
+    logger.info(
+        f"[MultipleTesting] trial #{trials} | deflation={deflation} | "
+        f"base_ic_threshold={base_threshold:.4f} | "
+        f"effective_threshold={effective_threshold:.4f} | llm_decision={decision}"
+    )
+
+    if not decision:
+        return False  # never flip a reject into an accept
+
+    # Real hurdle: reject when the candidate's |IC| is below the deflated bar.
+    # Reverse-direction factors are valid, so we compare on |IC|. If the candidate
+    # IC can't be recovered (or base is misconfigured), fall back to logging-only.
+    candidate_ic = _extract_candidate_ic(exp)
+    if base_threshold <= 0 or candidate_ic is None:
+        logger.info(
+            f"[MultipleTesting] trial #{trials}: candidate IC unavailable -> bar logged only "
+            f"(effective_threshold={effective_threshold:.4f})"
+        )
+        return decision
+
+    ic_mag = abs(float(candidate_ic))
+    passed = ic_mag >= effective_threshold
+    if not passed:
+        logger.warning(
+            f"[MultipleTesting] trial #{trials}: REJECT by data-snooping haircut "
+            f"(|IC|={ic_mag:.4f} < effective_threshold={effective_threshold:.4f}); "
+            f"the bar tightens as trials grow."
+        )
+    return decision and passed
 
 
 def process_results(current_result, sota_result):
@@ -200,6 +371,9 @@ class QlibFactorHypothesisExperiment2Feedback(HypothesisExperiment2Feedback):
         new_hypothesis = response_json.get("New Hypothesis", "No new hypothesis provided")
         reason = response_json.get("Reasoning", "No reasoning provided")
         decision = convert2bool(response_json.get("Replace Best Result", "no"))
+        # Apply multiple-testing haircut: tracks running trial count and raises
+        # the effective IC/IR acceptance bar as more factors are evaluated.
+        decision = apply_multiple_testing_haircut(decision, exp)
 
         return HypothesisFeedback(
             observations=observations,
@@ -329,6 +503,9 @@ class AlphaAgentQlibFactorHypothesisExperiment2Feedback(HypothesisExperiment2Fee
         new_hypothesis = response_json.get("New Hypothesis", "No new hypothesis provided")
         reason = response_json.get("Reasoning", "No reasoning provided")
         decision = convert2bool(response_json.get("Replace Best Result", "no"))
+        # Apply multiple-testing haircut: tracks running trial count and raises
+        # the effective IC/IR acceptance bar as more factors are evaluated.
+        decision = apply_multiple_testing_haircut(decision, exp)
 
         return HypothesisFeedback(
             observations=observations,

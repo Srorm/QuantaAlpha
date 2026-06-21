@@ -15,9 +15,9 @@ export const InputPanel: React.FC<InputPanelProps> = ({ onSubmit, isRunning }) =
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [config, setConfig] = useState<Partial<TaskConfig>>({
     numDirections: 2,
-    maxRounds: 7,
-    market: 'csi500',
-    parallelExecution: true,
+    maxRounds: 3,
+    market: 'all',
+    parallelExecution: false,
     qualityGateEnabled: true,
   });
 
@@ -125,10 +125,12 @@ export const InputPanel: React.FC<InputPanelProps> = ({ onSubmit, isRunning }) =
                   <select
                     value={config.market}
                     onChange={(e) =>
-                      setConfig({ ...config, market: e.target.value as 'csi500' | 'sp500' })
+                      setConfig({ ...config, market: e.target.value as 'all' | 'csi300' | 'csi500' | 'sp500' })
                     }
                     className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
                   >
+                    <option value="all">全A (全部A股, 5766只)</option>
+                    <option value="csi300">CSI 300 (沪深300)</option>
                     <option value="csi500">CSI 500 (中证500)</option>
                     <option value="sp500">S&P 500</option>
                   </select>
